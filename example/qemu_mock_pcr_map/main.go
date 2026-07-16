@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -199,6 +200,7 @@ var (
 	sockFile         string
 	swtpmAddr        string
 	swtpmCtrlAddr    string
+	tpmDevice        string
 	terminateOnClose bool
 )
 
@@ -206,21 +208,40 @@ func main() {
 	flag.StringVar(&sockFile, "fwd-sock", filepath.Join(os.TempDir(), "qemu_swtpm_fwd.sock"), "forwarding unix socket file")
 	flag.StringVar(&swtpmAddr, "swtpm", "127.0.0.1:2321", "swtpm address")
 	flag.StringVar(&swtpmCtrlAddr, "swtpm-ctrl", "127.0.0.1:2322", "swtpm ctrl address")
+	flag.StringVar(&tpmDevice, "tpm-device", "", "path to hardware TPM device (e.g. /dev/tpmrm0); overrides swtpm command address if set")
 	flag.BoolVar(&terminateOnClose, "terminate-on-close", true, "terminate relay on close")
 	flag.Parse()
 
 	emulated := newEmulatedPCRs()
 
+	var cmdFactory tpmproxy.ForwarderFactory
+	if tpmDevice != "" {
+		cmdFactory = tpmproxy.NewIoForwarderFactory(tpmDevice)
+		fmt.Printf("Configured proxy to use hardware TPM device at %s\n", tpmDevice)
+	} else {
+		cmdFactory = tpmproxy.NewTcpForwarderFactory(swtpmAddr)
+		fmt.Printf("Configured proxy to use swtpm TCP at %s\n", swtpmAddr)
+	}
+
+	var ctrlFactory tpmproxy.ForwarderFactory
+	if swtpmCtrlAddr == "dummy" || swtpmCtrlAddr == "" {
+		ctrlFactory = &dummyCtrlForwarderFactory{}
+		fmt.Println("Configured proxy to use dummy control channel in memory")
+	} else {
+		ctrlFactory = tpmproxy.NewTcpForwarderFactory(swtpmCtrlAddr)
+		fmt.Printf("Configured proxy to use swtpm control TCP at %s\n", swtpmCtrlAddr)
+	}
+
 	relay := tpmproxy.NewQemuCtrlRelayer(sockFile,
-		tpmproxy.NewTcpForwarderFactory(swtpmAddr),
-		tpmproxy.NewTcpForwarderFactory(swtpmCtrlAddr),
+		cmdFactory,
+		ctrlFactory,
 		terminateOnClose,
 		&staticMockPcrInterceptor{
 			EmulatedPCRs: emulated,
 			origCmds:     make(map[*tpmproxy.Request]originalRequest),
 		})
 
-	fmt.Printf("Starting TPM proxy on %s, forwarding to swtpm %s...\n", sockFile, swtpmAddr)
+	fmt.Printf("Starting TPM proxy on %s...\n", sockFile)
 	if err := relay.Relay(); err != nil {
 		fmt.Printf("error: %v\n", err)
 	}
@@ -648,4 +669,78 @@ func parsePCREventParams(buf *bytes.Buffer) (tpm2.TPM2BEvent, error) {
 	return tpm2.TPM2BEvent{
 		Buffer: eventBytes,
 	}, nil
+}
+
+type dummyCtrlForwarder struct {
+	readBuf  *bytes.Buffer
+	writeBuf *bytes.Buffer
+}
+
+func newDummyCtrlForwarder() *dummyCtrlForwarder {
+	return &dummyCtrlForwarder{
+		readBuf:  new(bytes.Buffer),
+		writeBuf: new(bytes.Buffer),
+	}
+}
+
+func (f *dummyCtrlForwarder) Read(p []byte) (int, error) {
+	if f.readBuf.Len() > 0 {
+		return f.readBuf.Read(p)
+	}
+	return 0, io.EOF
+}
+
+func (f *dummyCtrlForwarder) Write(p []byte) (int, error) {
+	f.writeBuf.Write(p)
+	for f.writeBuf.Len() >= 4 {
+		cmd := binary.BigEndian.Uint32(f.writeBuf.Bytes()[0:4])
+		var cmdLen int
+		switch cmd {
+		case 0x01: // CMD_GET_CAPABILITY
+			cmdLen = 4
+		case 0x02: // CMD_INIT
+			cmdLen = 8 // CMD_INIT (4) + flags (4)
+		case 0x03: // CMD_SHUTDOWN
+			cmdLen = 4
+		case 0x04: // CMD_GET_TPMESTABLISHED
+			cmdLen = 4
+		case 0x08: // CMD_SET_LOCALITY
+			cmdLen = 5 // CMD_SET_LOCALITY (4) + locality (1)
+		default:
+			cmdLen = 4
+		}
+
+		if f.writeBuf.Len() < cmdLen {
+			break // wait for more bytes
+		}
+
+		cmdBytes := make([]byte, cmdLen)
+		f.writeBuf.Read(cmdBytes)
+
+		switch cmd {
+		case 0x01: // CMD_GET_CAPABILITY
+			resp := make([]byte, 8)
+			binary.BigEndian.PutUint64(resp, 0x0000000000000002) // TPM 2.0 flag
+			f.readBuf.Write(resp)
+		case 0x04: // CMD_GET_TPMESTABLISHED
+			resp := make([]byte, 4)
+			binary.BigEndian.PutUint32(resp, 0)
+			f.readBuf.Write(resp)
+		default:
+			resp := make([]byte, 4)
+			binary.BigEndian.PutUint32(resp, 0)
+			f.readBuf.Write(resp)
+		}
+	}
+	return len(p), nil
+}
+
+func (f *dummyCtrlForwarder) Close() error {
+	return nil
+}
+
+type dummyCtrlForwarderFactory struct{}
+
+func (f *dummyCtrlForwarderFactory) NewForwarder() (tpmproxy.Forwarder, error) {
+	return newDummyCtrlForwarder(), nil
 }
